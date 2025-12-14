@@ -5,6 +5,7 @@
 支持重复运行，智能检测和合并历史数据
 """
 import os
+import requests
 import sys
 import time
 import pandas as pd
@@ -25,6 +26,119 @@ try:
 except ImportError:
     print("错误: 无法导入akshare，请检查安装")
     sys.exit(1)
+
+def stock_zh_a_hist(
+    symbol: str = "000001",
+    period: str = "daily",
+    start_date: str = "19700101",
+    end_date: str = "20500101",
+    adjust: str = "",
+    timeout: float = None,
+) -> pd.DataFrame:
+    """
+    东方财富网-行情首页-沪深京 A 股-每日行情
+    https://quote.eastmoney.com/concept/sh603777.html?from=classic
+    :param symbol: 股票代码
+    :type symbol: str
+    :param period: choice of {'daily', 'weekly', 'monthly'}
+    :type period: str
+    :param start_date: 开始日期
+    :type start_date: str
+    :param end_date: 结束日期
+    :type end_date: str
+    :param adjust: choice of {"qfq": "前复权", "hfq": "后复权", "": "不复权"}
+    :type adjust: str
+    :param timeout: choice of None or a positive float number
+    :type timeout: float
+    :return: 每日行情
+    :rtype: pandas.DataFrame
+    """
+    market_code = 1 if symbol.startswith("6") else 0
+    adjust_dict = {"qfq": "1", "hfq": "2", "": "0"}
+    period_dict = {"daily": "101", "weekly": "102", "monthly": "103"}
+    user_agents = [
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
+    ]
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
+        "ut": "7eea3edcaed734bea9cbfc24409ed989",
+        "klt": period_dict[period],
+        "fqt": adjust_dict[adjust],
+        "secid": f"{market_code}.{symbol}",
+        "beg": start_date,
+        "end": end_date,
+    }
+    for i, ua in enumerate(user_agents, 1):
+        print(f"\n测试User-Agent {i}: {ua[:50]}...")
+        
+        headers = {
+            'User-Agent': ua,
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Cookie': 'qgqp_b_id=95d60d9e8fddf74f67a20794c7134363; websitepoptg_api_time=1765697181278; st_si=65760895874002; fullscreengg=1; fullscreengg2=1; st_pvi=47762425721208; st_sp=2025-12-14%2015%3A26%3A23; st_inirUrl=https%3A%2F%2Fwww.google.com%2F; st_sn=34; st_psi=20251214173859443-113200313000-2658386402; st_asi=20251214173859443-113200313000-2658386402-hqdyweb.fbkbg-1; wsc_checkuser_ok=1',
+            # 'Referer': 'http://quote.eastmoney.com/',
+            'Referer': 'https://quote.eastmoney.com/kcb/688719.html',
+            'Host': 'push2his.eastmoney.com'
+        }
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            data_json = r.json()
+            if not (data_json["data"] and data_json["data"]["klines"]):
+                return pd.DataFrame()
+            temp_df = pd.DataFrame([item.split(",") for item in data_json["data"]["klines"]])
+            temp_df["股票代码"] = symbol
+            temp_df.columns = [
+                "日期",
+                "开盘",
+                "收盘",
+                "最高",
+                "最低",
+                "成交量",
+                "成交额",
+                "振幅",
+                "涨跌幅",
+                "涨跌额",
+                "换手率",
+                "股票代码",
+            ]
+            temp_df["日期"] = pd.to_datetime(temp_df["日期"], errors="coerce").dt.date
+            temp_df["开盘"] = pd.to_numeric(temp_df["开盘"], errors="coerce")
+            temp_df["收盘"] = pd.to_numeric(temp_df["收盘"], errors="coerce")
+            temp_df["最高"] = pd.to_numeric(temp_df["最高"], errors="coerce")
+            temp_df["最低"] = pd.to_numeric(temp_df["最低"], errors="coerce")
+            temp_df["成交量"] = pd.to_numeric(temp_df["成交量"], errors="coerce")
+            temp_df["成交额"] = pd.to_numeric(temp_df["成交额"], errors="coerce")
+            temp_df["振幅"] = pd.to_numeric(temp_df["振幅"], errors="coerce")
+            temp_df["涨跌幅"] = pd.to_numeric(temp_df["涨跌幅"], errors="coerce")
+            temp_df["涨跌额"] = pd.to_numeric(temp_df["涨跌额"], errors="coerce")
+            temp_df["换手率"] = pd.to_numeric(temp_df["换手率"], errors="coerce")
+            temp_df = temp_df[
+                [
+                    "日期",
+                    "股票代码",
+                    "开盘",
+                    "收盘",
+                    "最高",
+                    "最低",
+                    "成交量",
+                    "成交额",
+                    "振幅",
+                    "涨跌幅",
+                    "涨跌额",
+                    "换手率",
+                ]
+            ]
+            return temp_df
+        except Exception as e:
+            print(f"请求异常: {e}")
+    return pd.DataFrame()
+
 
 class SmartStockDataUpdater:
     """智能股票数据更新器"""
@@ -158,12 +272,13 @@ class SmartStockDataUpdater:
 
         try:
             # 获取新数据
-            df = ak.stock_zh_a_hist(
+            df = stock_zh_a_hist(
                 symbol=stock_code,
                 period='daily',
                 start_date=start_date,
                 end_date=end_date,
-                adjust='qfq'  # 前复权
+                adjust='qfq',  # 前复权
+                timeout=5
             )
 
             if df is None or df.empty:
@@ -296,6 +411,9 @@ class SmartStockDataUpdater:
             return {'error': '无法获取股票列表'}
 
         # 限制数量（用于测试）
+        import random
+        random.shuffle(stock_codes)
+
         if max_stocks:
             stock_codes = stock_codes[:max_stocks]
             print(f"⚠️ 测试模式：只更新前 {max_stocks} 只股票")
@@ -346,7 +464,7 @@ class SmartStockDataUpdater:
                 stats['minute_fail'] += 1
 
             # 请求间隔
-            time.sleep(10)
+            time.sleep(5)
 
         # 输出统计结果
         self._print_final_report(stats)
