@@ -206,22 +206,37 @@ class RollingStockPredictor:
             if predict_data is None:
                 return {"date": predict_date, "error": f"找不到 {predict_date} 的预测数据"}
 
-            # 预测
-            pred_proba = model.predict_proba(predict_data)[0]
-            pred_class = model.predict(predict_data)[0]
+            # 预测所有股票
+            pred_proba_all = model.predict_proba(predict_data)
+            pred_class_all = model.predict(predict_data)
+
+            # 为每支股票创建预测结果
+            stock_predictions = []
+            for i, (proba, pred_class) in enumerate(zip(pred_proba_all, pred_class_all)):
+                stock_code = predict_data.iloc[i]['stock_code'] if 'stock_code' in predict_data.columns else f"stock_{i}"
+                stock_result = {
+                    "stock_code": stock_code,
+                    "prediction": int(pred_class),
+                    "probability_over_5pct": float(proba[1]),
+                    "probability_under_5pct": float(proba[0]),
+                    "confidence": "high" if abs(proba[1] - proba[0]) > 0.3 else "medium" if abs(proba[1] - proba[0]) > 0.1 else "low"
+                }
+                stock_predictions.append(stock_result)
 
             result = {
                 "date": predict_date,
                 "train_cutoff": train_cutoff_date,
                 "train_samples": len(X_train),
                 "positive_ratio": float(y_train.mean()),
-                "prediction": int(pred_class),
-                "probability_over_5pct": float(pred_proba[1]),
-                "probability_under_5pct": float(pred_proba[0]),
-                "confidence": "high" if abs(pred_proba[1] - pred_proba[0]) > 0.3 else "medium" if abs(pred_proba[1] - pred_proba[0]) > 0.1 else "low"
+                "total_stocks": len(stock_predictions),
+                "predictions": stock_predictions,
+                # 为了向后兼容，保留单个股票的统计信息
+                "positive_predictions": sum(p['prediction'] for p in stock_predictions),
+                "avg_probability": sum(p['probability_over_5pct'] for p in stock_predictions) / len(stock_predictions)
             }
 
-            print(f"预测结果: {'上涨' if pred_class == 1 else '下跌'} (概率: {pred_proba[1]:.3f})")
+            print(f"预测完成: {len(stock_predictions)} 只股票，平均上涨概率: {result['avg_probability']:.3f}")
+            print(f"预计上涨股票: {result['positive_predictions']} 只")
 
             return result
 
@@ -447,20 +462,31 @@ class RollingStockPredictor:
         if not valid_predictions:
             return {"error": "没有有效的预测结果"}
 
-        # 提取预测和概率
-        y_pred = [p['prediction'] for p in valid_predictions]
-        y_proba = [p['probability_over_5pct'] for p in valid_predictions]
+        # 收集所有股票的预测结果
+        all_stock_predictions = []
+        for pred_result in valid_predictions:
+            if 'predictions' in pred_result:
+                # 新格式：包含多支股票的预测
+                all_stock_predictions.extend(pred_result['predictions'])
+            else:
+                # 兼容旧格式：单个预测
+                all_stock_predictions.append(pred_result)
 
-        print(f"总预测数: {len(predictions)}")
-        print(f"有效预测数: {len(valid_predictions)}")
+        # 提取预测和概率
+        y_pred = [p['prediction'] for p in all_stock_predictions]
+        y_proba = [p['probability_over_5pct'] for p in all_stock_predictions]
+
+        print(f"总日期数: {len(predictions)}")
+        print(f"有效日期数: {len(valid_predictions)}")
+        print(f"总股票预测数: {len(all_stock_predictions)}")
 
         # 计算基础指标
         accuracy = sum(y_pred) / len(y_pred) if y_pred else 0  # 正样本比例
 
-        # Top-5 准确率（概率最高的5个预测中实际上涨的比例）
-        if len(valid_predictions) >= 5:
+        # Top-5 准确率（概率最高的5个股票预测中实际上涨的比例）
+        if len(all_stock_predictions) >= 5:
             # 按概率排序，取前5个
-            sorted_preds = sorted(valid_predictions, key=lambda x: x['probability_over_5pct'], reverse=True)
+            sorted_preds = sorted(all_stock_predictions, key=lambda x: x['probability_over_5pct'], reverse=True)
             top5_predictions = sorted_preds[:5]
             top5_accuracy = sum(p['prediction'] for p in top5_predictions) / 5
         else:
@@ -468,12 +494,12 @@ class RollingStockPredictor:
 
         # 置信度分布
         confidence_dist = {}
-        for pred in valid_predictions:
+        for pred in all_stock_predictions:
             conf = pred['confidence']
             confidence_dist[conf] = confidence_dist.get(conf, 0) + 1
 
         # 概率分布统计
-        probas = [p['probability_over_5pct'] for p in valid_predictions]
+        probas = [p['probability_over_5pct'] for p in all_stock_predictions]
         proba_stats = {
             'mean': np.mean(probas),
             'std': np.std(probas),
@@ -483,18 +509,21 @@ class RollingStockPredictor:
         }
 
         results = {
-            'total_predictions': len(predictions),
-            'valid_predictions': len(valid_predictions),
+            'total_dates': len(predictions),
+            'valid_dates': len(valid_predictions),
+            'total_stocks': len(all_stock_predictions),
             'positive_predictions': sum(y_pred),
             'positive_ratio': sum(y_pred) / len(y_pred) if y_pred else 0,
             'top5_accuracy': top5_accuracy,
             'confidence_distribution': confidence_dist,
             'probability_stats': proba_stats,
-            'predictions': valid_predictions
+            'predictions': valid_predictions,
+            'all_stock_predictions': all_stock_predictions
         }
 
-        print(f"总预测数: {results['total_predictions']}")
-        print(f"有效预测数: {results['valid_predictions']}")
+        print(f"总日期数: {results['total_dates']}")
+        print(f"有效日期数: {results['valid_dates']}")
+        print(f"总股票预测数: {results['total_stocks']}")
         print(f"正样本预测数: {results['positive_predictions']}")
         print(f"正样本比例: {results['positive_ratio']:.3f}")
         if top5_accuracy is not None:
