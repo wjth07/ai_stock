@@ -107,25 +107,36 @@ class RollingStockPredictor:
         # 合并所有股票数据
         combined_data = pd.concat(all_data, ignore_index=True)
 
-        # 确保数据按交易日期和股票代码全局排序
+        # 分离特征和目标变量
+        feature_cols = self.feature_engineer.get_feature_columns()
+        target_cols = self.feature_engineer.get_target_columns()
+
+        # 只选择有效的特征列
+        available_features = [col for col in feature_cols if col in combined_data.columns]
+        available_targets = [col for col in target_cols if col in combined_data.columns]
+
+        if not available_targets:
+            raise ValueError("没有找到有效的目标变量列")
+
+        # 确保数据按日期和股票代码排序
         combined_data = combined_data.sort_values(by=['trade_date', 'stock_code']).reset_index(drop=True)
 
-        # 分离特征和目标
-        feature_cols = self.feature_engineer.get_feature_columns()
-        available_features = [col for col in feature_cols if col in combined_data.columns]
+        X = combined_data[available_features].copy()
+        y_t1 = combined_data['TARGET_T1_OVER_5PCT'].copy()
 
-        X = combined_data[available_features].copy().reset_index(drop=True)
-        y_t1 = combined_data['TARGET_T1_OVER_5PCT'].copy().reset_index(drop=True)
+        # 移除包含NaN的行
+        valid_rows = ~(X.isna().any(axis=1) | y_t1.isna())
+        X = X[valid_rows].reset_index(drop=True)
+        y_t1 = y_t1[valid_rows].reset_index(drop=True)
 
-        # 处理缺失值
-        X = X.fillna(method='ffill').fillna(0)
-        X = X.replace([np.inf, -np.inf], 0)
+        print(f"数据预处理完成: {len(X)} 条有效样本")
 
-        # 保存全量数据到缓存（不包含下采样）
+        # 保存到缓存
         print(f"✓ 保存全量数据到缓存: {self.cache_dir}")
+        os.makedirs(self.cache_dir, exist_ok=True)
         joblib.dump(X, X_cache_path)
         joblib.dump(y_t1, y_cache_path)
-        print("✓ 缓存保存完成")
+        print("✓ 全量数据缓存保存完成")
 
         # 根据当前的下采样比例进行动态下采样
         if self.majority_undersampling_ratio < 1.0:
@@ -136,52 +147,30 @@ class RollingStockPredictor:
         return X, y_t1
 
     def _apply_majority_undersampling(self, X: pd.DataFrame, y: pd.Series) -> Tuple[pd.DataFrame, pd.Series]:
-        """
-        应用多数类下采样
+        """应用多数类下采样"""
+        if len(y.unique()) < 2:
+            return X, y
 
-        Args:
-            X: 特征数据
-            y: 目标变量
-
-        Returns:
-            下采样后的数据
-        """
+        # 计算各类别样本数
         class_counts = y.value_counts()
+        minority_class = class_counts.idxmin()
         majority_class = class_counts.idxmax()
-        n_majority = class_counts[majority_class]
 
-        # 计算目标多数类样本数量
-        target_majority_count = int(n_majority * self.majority_undersampling_ratio)
+        target_majority_count = int(class_counts[minority_class] * (1 / self.majority_undersampling_ratio - 1))
+        target_majority_count = min(target_majority_count, class_counts[majority_class])
 
-        if target_majority_count < n_majority:
-            print(f"多数类样本 ({n_majority}) 将按比例 {self.majority_undersampling_ratio} 欠采样至 {target_majority_count}...")
+        if target_majority_count < class_counts[majority_class]:
+            # 使用随机下采样
+            rus = RandomUnderSampler(sampling_strategy={majority_class: target_majority_count}, random_state=42)
+            X_resampled, y_resampled = rus.fit_resample(X, y)
 
-            undersampler = RandomUnderSampler(
-                sampling_strategy={majority_class: target_majority_count},
-                random_state=42
-            )
-            X_resampled, y_resampled = undersampler.fit_resample(X, y)
-
-            print(f"欠采样后类别分布: {pd.Series(y_resampled).value_counts().to_dict()}")
-            return X_resampled, y_resampled
+            print(f"下采样结果: {dict(y_resampled.value_counts())}")
+            return pd.DataFrame(X_resampled, columns=X.columns), pd.Series(y_resampled)
         else:
-            print(f"多数类样本 ({n_majority}) 无需欠采样")
             return X, y
 
     def predict_single_day(self, train_cutoff_date: str, predict_date: str) -> Dict:
-        """
-        使用截止到train_cutoff_date的数据训练模型，预测predict_date的结果
-
-        Args:
-            train_cutoff_date: 训练数据截止日期
-            predict_date: 预测日期
-
-        Returns:
-            预测结果字典
-        """
-        print(f"\n=== 预测 {predict_date} ===")
-        print(f"训练数据截止: {train_cutoff_date}")
-
+        """预测单日结果"""
         try:
             # 准备训练数据
             X_train, y_train = self.prepare_data_for_date(cutoff_date=train_cutoff_date)
@@ -191,9 +180,9 @@ class RollingStockPredictor:
 
             # 训练模型
             model = GradientBoostingClassifier(
-                n_estimators=50,
-                max_depth=3,
-                learning_rate=0.1,
+                n_estimators=100,
+                max_depth=5,
+                learning_rate=0.15,
                 random_state=42,
                 verbose=1  # 显示训练进度
             )
@@ -207,13 +196,18 @@ class RollingStockPredictor:
                 return {"date": predict_date, "error": f"找不到 {predict_date} 的预测数据"}
 
             # 预测所有股票
-            pred_proba_all = model.predict_proba(predict_data)
-            pred_class_all = model.predict(predict_data)
+            predict_features = predict_data.drop(columns=['stock_code'], errors='ignore')
+
+            # 预测所有股票
+            pred_proba_all = model.predict_proba(predict_features)
+            pred_class_all = model.predict(predict_features)
 
             # 为每支股票创建预测结果
+            # 从预测数据中获取真实的股票代码
             stock_predictions = []
             for i, (proba, pred_class) in enumerate(zip(pred_proba_all, pred_class_all)):
-                stock_code = predict_data.iloc[i]['stock_code'] if 'stock_code' in predict_data.columns else f"stock_{i}"
+                # 从预测数据中获取股票代码
+                stock_code = predict_data.iloc[i].get('stock_code', f"stock_{i}")
                 stock_result = {
                     "stock_code": stock_code,
                     "prediction": int(pred_class),
@@ -235,8 +229,16 @@ class RollingStockPredictor:
                 "avg_probability": sum(p['probability_over_5pct'] for p in stock_predictions) / len(stock_predictions)
             }
 
+            # 打印上涨预测的股票
+            positive_stocks = [(p['stock_code'], p['probability_over_5pct']) for p in stock_predictions if p['prediction'] == 1]
+            if positive_stocks:
+                print(f"预计上涨>5%的股票 ({len(positive_stocks)}只):")
+                for code, prob in sorted(positive_stocks, key=lambda x: x[1], reverse=True):
+                    print(f"  {code}: {prob:.3f}")
+            else:
+                print("没有股票预计上涨>5%")
+
             print(f"预测完成: {len(stock_predictions)} 只股票，平均上涨概率: {result['avg_probability']:.3f}")
-            print(f"预计上涨股票: {result['positive_predictions']} 只")
 
             return result
 
@@ -299,6 +301,8 @@ class RollingStockPredictor:
 
                         features = day_data[available_features].copy()
                         if not features.empty:
+                            # 重新添加stock_code列（因为特征工程可能重置了索引）
+                            features = features.reset_index(drop=True)
                             features['stock_code'] = stock_code
                             all_predict_data.append(features)
 
@@ -312,9 +316,13 @@ class RollingStockPredictor:
         # 合并所有股票的预测数据
         predict_df = pd.concat(all_predict_data, ignore_index=True)
 
-        # 选择特征列（排除目标列）
+        # 选择特征列（排除目标列，但保留stock_code用于预测结果）
         feature_cols = self.feature_engineer.get_feature_columns()
         available_features = [col for col in feature_cols if col in predict_df.columns and not col.startswith('TARGET_')]
+
+        # 保留stock_code列用于预测结果
+        if 'stock_code' not in available_features:
+            available_features.append('stock_code')
 
         X_pred = predict_df[available_features].copy()
 
@@ -322,75 +330,42 @@ class RollingStockPredictor:
         X_pred = X_pred.fillna(method='ffill').fillna(0)
         X_pred = X_pred.replace([np.inf, -np.inf], 0)
 
-        # 保存到缓存
+        # 保存到缓存（包含股票代码）
         print(f"✓ 保存预测数据到缓存: {self.cache_dir}")
-        joblib.dump(X_pred, cache_path)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        joblib.dump(predict_df[available_features], cache_path)
         print("✓ 预测数据缓存保存完成")
 
         return X_pred
 
-    def rolling_predict(self, start_date: str = None, end_date: str = None, n_days: int = 30) -> List[Dict]:
+    def rolling_predict(self, start_date: str = None, n_days: int = 30, end_date: str = None) -> List[Dict]:
         """
         执行滚动预测
 
         Args:
-            start_date: 开始预测的日期
-            end_date: 结束预测的日期，配合n_days=1使用
+            start_date: 开始预测日期 (YYYY-MM-DD)
             n_days: 预测天数
+            end_date: 结束预测日期 (YYYY-MM-DD)，优先级高于n_days
 
         Returns:
             预测结果列表
         """
-        print("=" * 60)
-        print("开始滚动股票预测")
-        print("=" * 60)
-
-        # 处理预测日期范围
-        if end_date is not None:
-            # 如果指定了end_date
+        # 确定预测日期范围
+        if end_date:
+            # 使用指定的结束日期
             end_dt = pd.to_datetime(end_date)
-
-            if n_days == 1:
-                # predict-days=1时，只预测end_date当天
-                predict_dates = [end_dt]
-                print(f"预测日期: {end_date}")
-            else:
-                # predict-days>1时，预测end_date前面的n_days天
-                # 获取数据中的交易日
-                sample_files = [f for f in os.listdir("daily") if f.endswith('_daily.csv')]
-                if sample_files:
-                    sample_df = pd.read_csv(os.path.join("daily", sample_files[0]))
-                    if 'trade_date' in sample_df.columns:
-                        sample_df['trade_date'] = pd.to_datetime(sample_df['trade_date'], format='%Y%m%d')
-                        all_dates = sorted(sample_df['trade_date'].unique())
-
-                        # 找到end_dt在数据中的位置
-                        end_idx = None
-                        for i, date in enumerate(all_dates):
-                            if date >= end_dt:
-                                end_idx = i
-                                break
-
-                        if end_idx is not None and end_idx >= n_days:
-                            # 取end_dt前面的n_days个交易日
-                            predict_dates = all_dates[end_idx-n_days:end_idx]
-                        else:
-                            # 如果数据不够，尽量取可用的日期
-                            predict_dates = all_dates[-n_days:] if len(all_dates) >= n_days else all_dates
-                    else:
-                        # 如果无法读取数据日期，使用简单的工作日计算
-                        predict_dates = pd.date_range(end=end_dt, periods=n_days, freq='B')
-                else:
-                    # 如果无法读取数据，使用简单的工作日计算
-                    predict_dates = pd.date_range(end=end_dt, periods=n_days, freq='B')
-
-                print(f"预测日期范围: {predict_dates[0].strftime('%Y-%m-%d')} 到 {predict_dates[-1].strftime('%Y-%m-%d')}")
-
-        elif start_date is None:
-            # 没有指定start_date和end_date，使用原来的逻辑：预测最后n_days天
+            predict_dates = [end_dt]
+            print(f"预测指定日期: {end_date}")
+        elif start_date:
+            # 使用指定的开始日期和天数
+            start_dt = pd.to_datetime(start_date)
+            predict_dates = pd.date_range(start=start_dt, periods=n_days, freq='B')  # 工作日
+            print(f"预测日期范围: {start_dt.strftime('%Y-%m-%d')} 到 {(start_dt + pd.Timedelta(days=n_days-1)).strftime('%Y-%m-%d')}")
+        else:
+            # 自动选择最近的交易日
             sample_files = [f for f in os.listdir("daily") if f.endswith('_daily.csv')]
             if not sample_files:
-                raise ValueError("没有找到股票数据文件")
+                raise ValueError("daily目录中没有找到CSV文件")
 
             sample_df = pd.read_csv(os.path.join("daily", sample_files[0]))
 
@@ -407,11 +382,6 @@ class RollingStockPredictor:
                 print(f"预测日期范围: {predict_dates[0].strftime('%Y-%m-%d')} 到 {predict_dates[-1].strftime('%Y-%m-%d')}")
             else:
                 raise ValueError("数据文件中没有trade_date列")
-        else:
-            # 使用指定的start_date
-            start_dt = pd.to_datetime(start_date)
-            predict_dates = pd.date_range(start=start_dt, periods=n_days, freq='B')  # 工作日
-            print(f"预测日期范围: {predict_dates[0].strftime('%Y-%m-%d')} 到 {predict_dates[-1].strftime('%Y-%m-%d')}")
 
         print(f"将预测以下 {len(predict_dates)} 个日期:")
         for i, date in enumerate(predict_dates):
@@ -435,6 +405,12 @@ class RollingStockPredictor:
                 train_cutoff_date=train_cutoff_dt.strftime('%Y-%m-%d'),
                 predict_date=predict_dt.strftime('%Y-%m-%d')
             )
+
+            # 增加实际收益率标签评估
+            if result is not None and 'predictions' in result:
+                eval_gt = self.evaluate_predictions_with_ground_truth(result['predictions'], predict_dt.strftime('%Y-%m-%d'), daily_dir="daily")
+                if eval_gt:
+                    result['real_metrics'] = eval_gt
 
             results.append(result)
 
@@ -476,9 +452,23 @@ class RollingStockPredictor:
         y_pred = [p['prediction'] for p in all_stock_predictions]
         y_proba = [p['probability_over_5pct'] for p in all_stock_predictions]
 
+        # 计算基础统计
+        positive_predictions = sum(y_pred)
+
         print(f"总日期数: {len(predictions)}")
         print(f"有效日期数: {len(valid_predictions)}")
         print(f"总股票预测数: {len(all_stock_predictions)}")
+        print(f"正样本预测数: {positive_predictions}")
+        print(f"正样本比例: {positive_predictions / len(y_pred) if y_pred else 0:.3f}")
+
+        # 打印上涨预测的股票
+        positive_stocks = [p['stock_code'] for p in all_stock_predictions if p['prediction'] == 1]
+        if positive_stocks:
+            print(f"预计上涨>5%的股票 ({len(positive_stocks)}只): {', '.join(positive_stocks[:10])}")  # 只显示前10个
+            if len(positive_stocks) > 10:
+                print(f"  ... 还有 {len(positive_stocks) - 10} 只股票")
+        else:
+            print("没有股票预计上涨>5%")
 
         # 计算基础指标
         accuracy = sum(y_pred) / len(y_pred) if y_pred else 0  # 正样本比例
@@ -508,7 +498,7 @@ class RollingStockPredictor:
             'median': np.median(probas)
         }
 
-        results = {
+        eval_results = {
             'total_dates': len(predictions),
             'valid_dates': len(valid_predictions),
             'total_stocks': len(all_stock_predictions),
@@ -521,11 +511,21 @@ class RollingStockPredictor:
             'all_stock_predictions': all_stock_predictions
         }
 
-        print(f"总日期数: {results['total_dates']}")
-        print(f"有效日期数: {results['valid_dates']}")
-        print(f"总股票预测数: {results['total_stocks']}")
-        print(f"正样本预测数: {results['positive_predictions']}")
-        print(f"正样本比例: {results['positive_ratio']:.3f}")
+        print(f"总日期数: {eval_results['total_dates']}")
+        print(f"有效日期数: {eval_results['valid_dates']}")
+        print(f"总股票预测数: {eval_results['total_stocks']}")
+        print(f"正样本预测数: {eval_results['positive_predictions']}")
+        print(f"正样本比例: {eval_results['positive_ratio']:.3f}")
+
+        # 打印上涨预测的股票
+        positive_stocks = [p['stock_code'] for p in all_stock_predictions if p['prediction'] == 1]
+        if positive_stocks:
+            print(f"预计上涨>5%的股票 ({len(positive_stocks)}只): {', '.join(positive_stocks[:10])}")  # 只显示前10个
+            if len(positive_stocks) > 10:
+                print(f"  ... 还有 {len(positive_stocks) - 10} 只股票")
+        else:
+            print("没有股票预计上涨>5%")
+
         if top5_accuracy is not None:
             print(f"Top-5准确率: {top5_accuracy:.3f}")
         print(f"置信度分布: {confidence_dist}")
@@ -535,42 +535,226 @@ class RollingStockPredictor:
         print(f"最大概率: {proba_stats['max']:.3f}")
         print(f"中位数概率: {proba_stats['median']:.3f}")
 
-        return results
+        return eval_results
+
+    def evaluate_predictions_with_ground_truth(self, predictions: List[Dict], predict_date: str, daily_dir: str = "daily") -> Dict:
+        """
+        根据实际T+1收益标签，评估模型预测效果
+        Args:
+            predictions: List[Dict] 模型预测结果
+            predict_date: 用于评估的日期字符串（"YYYY-MM-DD"），如"2025-12-19"
+            daily_dir: 行情csv目录
+        Returns:
+            dict, 包含准确率、精确率、召回率、F1、混淆矩阵等
+        """
+        import pandas as pd
+        import os
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
+
+        date_str = predict_date.replace('-', '')
+        # 收集每个股票的预测和真实收益
+        pred_labels, real_labels, codes, probs = [], [], [], []
+        # 组织预测结果为dict
+        pred_dict = {p['stock_code']: p for p in predictions if 'stock_code' in p}
+        for file in os.listdir(daily_dir):
+            if file.endswith('_daily.csv'):
+                code = file.replace('_daily.csv', '')
+                df = pd.read_csv(os.path.join(daily_dir, file))
+                df['trade_date'] = df['trade_date'].astype(str)
+                # 找到predict_date-1和predict_date行数据
+                d_before = df[df['trade_date'] == self.get_last_trade_date(df, date_str)]
+                d_today = df[df['trade_date'] == date_str]
+                if not d_before.empty and not d_today.empty and code in pred_dict:
+                    close_before = d_before.iloc[0]['close']
+                    close_today = d_today.iloc[0]['close']
+                    # 计算T+1收益率
+                    real_return = (close_today / close_before) - 1
+                    real_label = 1 if real_return > 0.05 else 0
+                    pred = pred_dict[code]['prediction']
+                    prob = pred_dict[code]['probability_over_5pct']
+                    pred_labels.append(pred)
+                    real_labels.append(real_label)
+                    codes.append(code)
+                    probs.append(prob)
+
+        metrics = {}
+        if pred_labels and real_labels:
+            metrics["准确率"] = accuracy_score(real_labels, pred_labels)
+            metrics["精确率"] = precision_score(real_labels, pred_labels, zero_division=0)
+            metrics["召回率"] = recall_score(real_labels, pred_labels, zero_division=0)
+            metrics["F1"] = f1_score(real_labels, pred_labels, zero_division=0)
+            metrics["分类报告"] = classification_report(real_labels, pred_labels, zero_division=0, target_names=["<=5%", ">5%"])
+            metrics["混淆矩阵"] = confusion_matrix(real_labels, pred_labels).tolist()
+
+            # 新增Top-N准确率计算（预测为正的分数从高到低排序，前N个预测正确的比例）
+            positive_predictions = [(p['stock_code'], p['probability_over_5pct'], pred_dict.get(p['stock_code'], {}).get('prediction', 0)) for p in predictions if p['stock_code'] in pred_dict and pred_dict[p['stock_code']]['prediction'] == 1]
+            if positive_predictions:
+                # 按概率排序，取前10个（或全部如果小于10）
+                top_n = min(10, len(positive_predictions))
+                sorted_positive = sorted(positive_predictions, key=lambda x: x[1], reverse=True)[:top_n]
+
+                correct_count = 0
+                for code, prob, pred in sorted_positive:
+                    # 从real_labels中找到对应的真实标签
+                    if code in codes:
+                        idx = codes.index(code)
+                        real_label = real_labels[idx]
+                        if real_label == 1:  # 实际也上涨了
+                            correct_count += 1
+
+                top_n_accuracy = correct_count / top_n if top_n > 0 else 0
+                metrics["Top-10准确率"] = top_n_accuracy
+                metrics["Top-10详情"] = [(code, prob, pred) for code, prob, pred in sorted_positive]
+                print(f"Top-10准确率: {top_n_accuracy:.3f} (预测上涨概率最高的前{min(10, len(positive_predictions))}只股票中，实际上涨的比例)")
+            else:
+                metrics["Top-10准确率"] = 0
+                print("Top-10准确率: N/A (没有预测为上涨的股票)")
+
+            print("\n===== 真实T+1收益标签评估 =====")
+            print(f"总样本数: {len(pred_labels)}")
+            print(f"准确率: {metrics['准确率']:.3f}")
+            print(f"精确率: {metrics['精确率']:.3f}")
+            print(f"召回率: {metrics['召回率']:.3f}")
+            print(f"F1分数: {metrics['F1']:.3f}")
+            print(f"混淆矩阵(n=0是<=5%，n=1是>5%): ")
+            print(metrics['混淆矩阵'])
+
+        return metrics
+
+    @staticmethod
+    def get_last_trade_date(df: pd.DataFrame, date_str: str) -> str:
+        all_dates = sorted(df['trade_date'].unique())
+        if date_str in all_dates:
+            idx = all_dates.index(date_str)
+            if idx >= 1:
+                return all_dates[idx-1]
+        return None
+
+    def _cleanup_old_prediction_files(self, results_dir: str, max_files: int = 20):
+        """
+        清理旧的预测结果文件，保持最多max_files个文件
+
+        Args:
+            results_dir: 结果文件目录
+            max_files: 最大文件数量
+        """
+        import glob
+
+        # 获取所有预测结果文件
+        json_files = glob.glob(os.path.join(results_dir, "predictions_*.json"))
+        csv_files = glob.glob(os.path.join(results_dir, "predictions_*.csv"))
+
+        # 合并所有文件，按修改时间排序
+        all_files = json_files + csv_files
+        all_files.sort(key=lambda x: os.path.getmtime(x))
+
+        # 如果文件数量超过限制，删除最旧的文件
+        if len(all_files) > max_files:
+            files_to_delete = all_files[:len(all_files) - max_files]  # 保留最新的max_files个，删除其余的
+            for file_path in files_to_delete:
+                try:
+                    os.remove(file_path)
+                    print(f"✓ 删除旧预测文件: {os.path.basename(file_path)}")
+                except Exception as e:
+                    print(f"删除文件失败 {file_path}: {e}")
+
+    def save_predictions(self, results: List[Dict], evaluation: Dict):
+        """
+        保存预测结果到文件（最多保留20个文件）
+
+        Args:
+            results: 预测结果列表
+            evaluation: 评估结果字典
+        """
+        import json
+        from datetime import datetime
+
+        # 创建结果目录
+        results_dir = os.path.join(self.model_dir, "prediction_results")
+        os.makedirs(results_dir, exist_ok=True)
+
+        # 清理旧文件，保持最多20个文件
+        self._cleanup_old_prediction_files(results_dir, max_files=20)
+
+        # 生成文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_file = os.path.join(results_dir, f"predictions_{timestamp}.json")
+        csv_file = os.path.join(results_dir, f"predictions_{timestamp}.csv")
+
+        # 准备数据用于保存
+        all_predictions = []
+        for date_result in results:
+            if 'error' not in date_result and 'predictions' in date_result:
+                for stock_pred in date_result['predictions']:
+                    prediction_record = {
+                        'date': date_result['date'],
+                        'stock_code': stock_pred['stock_code'],
+                        'prediction': stock_pred['prediction'],
+                        'probability_over_5pct': stock_pred['probability_over_5pct'],
+                        'probability_under_5pct': stock_pred['probability_under_5pct'],
+                        'confidence': stock_pred['confidence'],
+                        'train_cutoff': date_result.get('train_cutoff'),
+                        'train_samples': date_result.get('train_samples'),
+                        'positive_ratio': date_result.get('positive_ratio')
+                    }
+                    all_predictions.append(prediction_record)
+
+        # 保存为JSON
+        result_data = {
+            'metadata': {
+                'timestamp': timestamp,
+                'total_dates': len(results),
+                'total_stocks': len(all_predictions),
+                'evaluation': evaluation
+            },
+            'predictions': all_predictions
+        }
+
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(result_data, f, indent=2, ensure_ascii=False)
+
+        # 保存为CSV
+        if all_predictions:
+            df = pd.DataFrame(all_predictions)
+            df.to_csv(csv_file, index=False, encoding='utf-8')
+
+        print(f"\n预测结果已保存:")
+        print(f"  JSON: {json_file}")
+        print(f"  CSV: {csv_file}")
+
 
 def main():
     """主函数"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='滚动股票预测器')
-    parser.add_argument('--predict-days', type=int, default=30, help='预测天数')
-    parser.add_argument('--start-date', type=str, help='开始预测日期 (YYYY-MM-DD)')
-    parser.add_argument('--end-date', type=str, help='结束预测日期 (YYYY-MM-DD)，配合predict-days=1使用')
-    parser.add_argument('--majority-undersampling-ratio', type=float, default=0.1,
-                       help='多数类样本下采样比例 (0-1之间，默认0.1)')
-    parser.add_argument('--max-stocks', type=int, help='最大股票数量，用于调试 (默认使用全部股票)')
+    parser = argparse.ArgumentParser(description='A股股票预测器')
+    parser.add_argument('--end-date', type=str, help='预测结束日期 (YYYY-MM-DD)')
+    parser.add_argument('--predict-days', type=int, default=1, help='预测天数')
+    parser.add_argument('--max-stocks', type=int, help='限制股票数量用于调试')
+    parser.add_argument('--majority-undersampling-ratio', type=float, default=0.1, help='多数类下采样比例')
 
     args = parser.parse_args()
 
+    # 创建预测器
     predictor = RollingStockPredictor(
         majority_undersampling_ratio=args.majority_undersampling_ratio,
         max_stocks=args.max_stocks
     )
 
-    try:
-        # 执行滚动预测
-        results = predictor.rolling_predict(
-            start_date=args.start_date,
-            end_date=args.end_date,
-            n_days=args.predict_days
-        )
+    # 执行滚动预测
+    results = predictor.rolling_predict(
+        end_date=args.end_date,
+        n_days=args.predict_days
+    )
 
-        # 评估结果
-        evaluation = predictor.evaluate_predictions(results)
+    # 评估结果
+    evaluation = predictor.evaluate_predictions(results)
 
-        print("\n预测完成！")
+    # 保存预测结果
+    predictor.save_predictions(results, evaluation)
 
-    except Exception as e:
-        print(f"执行失败: {e}")
+    print("\n预测完成！")
+
 
 if __name__ == "__main__":
     main()
