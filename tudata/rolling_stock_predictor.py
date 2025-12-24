@@ -358,8 +358,22 @@ class RollingStockPredictor:
             预测结果列表
         """
         # 确定预测日期范围
-        if end_date:
-            # 使用指定的结束日期
+        if end_date and n_days > 1:
+            # 同时指定了结束日期和天数：从结束日期向前n_days个工作日进行滚动预测
+            end_dt = pd.to_datetime(end_date)
+            # 生成从end_date向前n_days个工作日的日期序列
+            predict_dates = []
+            current_dt = end_dt
+            count = 0
+            while count < n_days:
+                if current_dt.weekday() < 5:  # 工作日 (0-4: Mon-Fri)
+                    predict_dates.append(current_dt)
+                    count += 1
+                current_dt = current_dt - pd.Timedelta(days=1)
+            predict_dates.reverse()  # 确保按时间顺序
+            print(f"滚动预测日期范围: {predict_dates[0].strftime('%Y-%m-%d')} 到 {predict_dates[-1].strftime('%Y-%m-%d')} ({len(predict_dates)}天)")
+        elif end_date:
+            # 只指定了结束日期：预测这一天
             end_dt = pd.to_datetime(end_date)
             predict_dates = [end_dt]
             print(f"预测指定日期: {end_date}")
@@ -523,15 +537,6 @@ class RollingStockPredictor:
         print(f"总股票预测数: {eval_results['total_stocks']}")
         print(f"正样本预测数: {eval_results['positive_predictions']}")
         print(f"正样本比例: {eval_results['positive_ratio']:.3f}")
-
-        # 打印上涨预测的股票
-        positive_stocks = [p['stock_code'] for p in all_stock_predictions if p['prediction'] == 1]
-        if positive_stocks:
-            print(f"预计上涨>5%的股票 ({len(positive_stocks)}只): {', '.join(positive_stocks[:10])}")  # 只显示前10个
-            if len(positive_stocks) > 10:
-                print(f"  ... 还有 {len(positive_stocks) - 10} 只股票")
-        else:
-            print("没有股票预计上涨>5%")
 
         if top5_accuracy is not None:
             print(f"Top-5准确率: {top5_accuracy:.3f}")
