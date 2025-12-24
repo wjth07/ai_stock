@@ -156,7 +156,11 @@ class RollingStockPredictor:
         minority_class = class_counts.idxmin()
         majority_class = class_counts.idxmax()
 
-        target_majority_count = int(class_counts[minority_class] * (1 / self.majority_undersampling_ratio - 1))
+        # 当ratio很小时，直接按ratio比例采样多数类
+        if self.majority_undersampling_ratio < 0.1:
+            target_majority_count = int(class_counts[majority_class] * self.majority_undersampling_ratio)
+        else:
+            target_majority_count = int(class_counts[minority_class] * (1 / self.majority_undersampling_ratio - 1))
         target_majority_count = min(target_majority_count, class_counts[majority_class])
 
         if target_majority_count < class_counts[majority_class]:
@@ -180,8 +184,8 @@ class RollingStockPredictor:
 
             # 训练模型
             model = GradientBoostingClassifier(
-                n_estimators=100,
-                max_depth=5,
+                n_estimators=20,
+                max_depth=3,
                 learning_rate=0.15,
                 random_state=42,
                 verbose=1  # 显示训练进度
@@ -229,12 +233,16 @@ class RollingStockPredictor:
                 "avg_probability": sum(p['probability_over_5pct'] for p in stock_predictions) / len(stock_predictions)
             }
 
-            # 打印上涨预测的股票
+            # 打印上涨预测的股票（只显示Top10）
             positive_stocks = [(p['stock_code'], p['probability_over_5pct']) for p in stock_predictions if p['prediction'] == 1]
             if positive_stocks:
-                print(f"预计上涨>5%的股票 ({len(positive_stocks)}只):")
-                for code, prob in sorted(positive_stocks, key=lambda x: x[1], reverse=True):
+                sorted_positive = sorted(positive_stocks, key=lambda x: x[1], reverse=True)
+                top_n = min(10, len(sorted_positive))
+                print(f"预计上涨>5%的股票 (Top{top_n}/{len(positive_stocks)}只):")
+                for code, prob in sorted_positive[:top_n]:
                     print(f"  {code}: {prob:.3f}")
+                if len(positive_stocks) > 10:
+                    print(f"  ... 还有 {len(positive_stocks) - 10} 只股票")
             else:
                 print("没有股票预计上涨>5%")
 
@@ -286,7 +294,6 @@ class RollingStockPredictor:
             try:
                 # 使用预测专用的特征工程方法（不包含目标变量，与训练保持一致）
                 df = self.feature_engineer.process_single_stock_for_prediction(file_path)
-                print(f'df: {df}, {max(df["trade_date"])}')
 
                 if not df.empty:
                     # 找到指定日期的数据
