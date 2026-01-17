@@ -21,12 +21,13 @@ warnings.filterwarnings('ignore')
 class RollingStockPredictor:
     """滚动股票预测器"""
 
-    def __init__(self, model_dir: str = "models", majority_undersampling_ratio: float = 0.1, max_stocks: int = None):
+    def __init__(self, model_dir: str = "models", majority_undersampling_ratio: float = 0.2, max_stocks: int = None, exclude_one_word_limit: bool = False):
         self.model_dir = os.path.join(model_dir, "rolling_models")
         self.cache_dir = os.path.join(self.model_dir, "cache")
         self.feature_engineer = StockFeatureEngineer()
         self.majority_undersampling_ratio = majority_undersampling_ratio
         self.max_stocks = max_stocks
+        self.exclude_one_word_limit = exclude_one_word_limit
 
         # 创建目录
         os.makedirs(self.model_dir, exist_ok=True)
@@ -85,7 +86,7 @@ class RollingStockPredictor:
 
             try:
                 # 处理单个股票的特征工程
-                df = self.feature_engineer.process_single_stock(file_path)
+                df = self.feature_engineer.process_single_stock(file_path, exclude_one_word_limit=self.exclude_one_word_limit)
 
                 if not df.empty and len(df) > 30:
                     # 过滤掉cutoff_date之后的数据
@@ -184,14 +185,29 @@ class RollingStockPredictor:
 
             # 训练模型
             model = GradientBoostingClassifier(
-                n_estimators=20,
-                max_depth=3,
-                learning_rate=0.15,
+                n_estimators=200,        # 增加树的数量
+                max_depth=5,            # 增加树深度，捕捉更复杂模式
+                learning_rate=0.1,      # 降低学习率，提高稳定性
+                subsample=0.8,          # 使用80%样本训练，防止过拟合
+                min_samples_split=20,   # 内部节点最小样本数
+                min_samples_leaf=10,    # 叶子节点最小样本数
+                max_features='sqrt',    # 每次分裂考虑sqrt(n_features)个特征
                 random_state=42,
                 verbose=1  # 显示训练进度
             )
 
             model.fit(X_train, y_train)
+
+            # 在训练集上进行评估
+            y_train_pred = model.predict(X_train)
+            y_train_proba = model.predict_proba(X_train)[:, 1]
+            train_accuracy = accuracy_score(y_train, y_train_pred)
+            try:
+                train_auc = roc_auc_score(y_train, y_train_proba)
+            except ValueError:
+                train_auc = 0.5  # 如果只有一个类别，AUC无法计算
+            
+            print(f"训练集评估 - Accuracy: {train_accuracy:.3f}, AUC: {train_auc:.3f}")
 
             # 准备预测数据 - 只需要predict_date当天的数据
             predict_data = self.load_single_day_data(predict_date)
@@ -226,6 +242,8 @@ class RollingStockPredictor:
                 "train_cutoff": train_cutoff_date,
                 "train_samples": len(X_train),
                 "positive_ratio": float(y_train.mean()),
+                "train_accuracy": float(train_accuracy),
+                "train_auc": float(train_auc),
                 "total_stocks": len(stock_predictions),
                 "predictions": stock_predictions,
                 # 为了向后兼容，保留单个股票的统计信息
@@ -551,17 +569,19 @@ class RollingStockPredictor:
 
     def evaluate_predictions_with_ground_truth(self, predictions: List[Dict], predict_date: str, daily_dir: str = "daily") -> Dict:
         """
-        根据实际T+1收益标签，评估模型预测效果
+        根据实际T+1收益标签，评估模型对T+1日的预测效果
+        预测使用截至T日的数据，预测T+1日是否上涨>5%，评估使用T+1日的实际涨幅
+
         Args:
-            predictions: List[Dict] 模型预测结果
-            predict_date: 用于评估的日期字符串（"YYYY-MM-DD"），如"2025-12-19"
+            predictions: List[Dict] 模型预测结果（对T+1日的预测）
+            predict_date: 预测日期字符串（"YYYY-MM-DD"），如"2026-01-06"
             daily_dir: 行情csv目录
         Returns:
             dict, 包含准确率、精确率、召回率、F1、混淆矩阵等
         """
         import pandas as pd
         import os
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report, roc_auc_score
 
         date_str = predict_date.replace('-', '')
         # 收集每个股票的预测和真实收益
@@ -573,14 +593,14 @@ class RollingStockPredictor:
                 code = file.replace('_daily.csv', '')
                 df = pd.read_csv(os.path.join(daily_dir, file))
                 df['trade_date'] = df['trade_date'].astype(str)
-                # 找到predict_date-1和predict_date行数据
-                d_before = df[df['trade_date'] == self.get_last_trade_date(df, date_str)]
+                # 找到predict_date和predict_date+1行数据（用于验证对T+1日的预测）
                 d_today = df[df['trade_date'] == date_str]
-                if not d_before.empty and not d_today.empty and code in pred_dict:
-                    close_before = d_before.iloc[0]['close']
+                d_next = df[df['trade_date'] == self.get_next_trade_date(df, date_str)]
+                if not d_today.empty and not d_next.empty and code in pred_dict:
                     close_today = d_today.iloc[0]['close']
-                    # 计算T+1收益率
-                    real_return = (close_today / close_before) - 1
+                    close_next = d_next.iloc[0]['close']
+                    # 计算T+1日收益率（验证对明天的预测）
+                    real_return = (close_next / close_today) - 1
                     real_label = 1 if real_return > 0.05 else 0
                     pred = pred_dict[code]['prediction']
                     prob = pred_dict[code]['probability_over_5pct']
@@ -595,32 +615,69 @@ class RollingStockPredictor:
             metrics["精确率"] = precision_score(real_labels, pred_labels, zero_division=0)
             metrics["召回率"] = recall_score(real_labels, pred_labels, zero_division=0)
             metrics["F1"] = f1_score(real_labels, pred_labels, zero_division=0)
-            metrics["分类报告"] = classification_report(real_labels, pred_labels, zero_division=0, target_names=["<=5%", ">5%"])
-            metrics["混淆矩阵"] = confusion_matrix(real_labels, pred_labels).tolist()
+            
+            if len(set(real_labels)) > 1:
+                try:
+                    metrics["AUC"] = roc_auc_score(real_labels, probs)
+                except ValueError:
+                    metrics["AUC"] = 0.5
+            else:
+                metrics["AUC"] = 0.5
+                
+            metrics["分类报告"] = classification_report(real_labels, pred_labels, zero_division=0, target_names=["<=5%", ">5%"], labels=[0, 1])
+            metrics["混淆矩阵"] = confusion_matrix(real_labels, pred_labels, labels=[0, 1]).tolist()
 
             # 新增Top-N准确率计算（预测为正的分数从高到低排序，前N个预测正确的比例）
             positive_predictions = [(p['stock_code'], p['probability_over_5pct'], pred_dict.get(p['stock_code'], {}).get('prediction', 0)) for p in predictions if p['stock_code'] in pred_dict and pred_dict[p['stock_code']]['prediction'] == 1]
             if positive_predictions:
-                # 按概率排序，取前10个（或全部如果小于10）
-                top_n = min(10, len(positive_predictions))
+                # 按概率排序，取前20个（或全部如果小于20）
+                top_n = min(20, len(positive_predictions))
                 sorted_positive = sorted(positive_predictions, key=lambda x: x[1], reverse=True)[:top_n]
 
                 correct_count = 0
+                top_details = []
                 for code, prob, pred in sorted_positive:
-                    # 从real_labels中找到对应的真实标签
+                    # 从real_labels中找到对应的真实标签和实际涨幅
+                    real_label = 0
+                    actual_return_pct = 0.0
                     if code in codes:
                         idx = codes.index(code)
                         real_label = real_labels[idx]
-                        if real_label == 1:  # 实际也上涨了
-                            correct_count += 1
+
+                        # 计算实际涨幅百分比：需要重新从数据中提取
+                        # 找到对应的股票数据
+                        stock_file = os.path.join(daily_dir, f"{code}_daily.csv")
+                        if os.path.exists(stock_file):
+                            stock_df = pd.read_csv(stock_file)
+                            stock_df['trade_date'] = stock_df['trade_date'].astype(str)
+                            d_today_data = stock_df[stock_df['trade_date'] == date_str]
+                            d_next_data = stock_df[stock_df['trade_date'] == self.get_next_trade_date(stock_df, date_str)]
+
+                            if not d_today_data.empty and not d_next_data.empty:
+                                close_today = d_today_data.iloc[0]['close']
+                                close_next = d_next_data.iloc[0]['close']
+                                actual_return_pct = ((close_next / close_today) - 1) * 100
+
+                    if real_label == 1:  # T+1日实际也上涨了>5%
+                        correct_count += 1
+
+                    top_details.append((code, prob, pred, real_label, actual_return_pct))
 
                 top_n_accuracy = correct_count / top_n if top_n > 0 else 0
-                metrics["Top-10准确率"] = top_n_accuracy
-                metrics["Top-10详情"] = [(code, prob, pred) for code, prob, pred in sorted_positive]
-                print(f"Top-10准确率: {top_n_accuracy:.3f} (预测上涨概率最高的前{min(10, len(positive_predictions))}只股票中，实际上涨的比例)")
+                metrics["Top-20准确率"] = top_n_accuracy
+                metrics["Top-20详情"] = top_details
+
+                print(f"Top-20准确率: {top_n_accuracy:.3f} (预测T+1日上涨概率最高的前{min(20, len(positive_predictions))}只股票中，T+1日实际涨幅>5%的比例)")
+                print("\nTop-20预测详情:")
+                print("排名 股票代码   预测概率  预测结果  实际涨幅>5%  实际涨幅(%)")
+                print("-" * 70)
+                for i, (code, prob, pred, real_label, actual_return) in enumerate(top_details, 1):
+                    status = "✓" if real_label == 1 else "✗"
+                    pred_result = "上涨>5%" if pred == 1 else "下跌<=5%"
+                    print(f"{i:2d}  {code:<10} {prob:.3f}     {pred_result:<10} {status:<12} {actual_return:+.2f}%")
             else:
-                metrics["Top-10准确率"] = 0
-                print("Top-10准确率: N/A (没有预测为上涨的股票)")
+                metrics["Top-20准确率"] = 0
+                print("Top-20准确率: N/A (没有预测为上涨的股票)")
 
             print("\n===== 真实T+1收益标签评估 =====")
             print(f"总样本数: {len(pred_labels)}")
@@ -628,6 +685,7 @@ class RollingStockPredictor:
             print(f"精确率: {metrics['精确率']:.3f}")
             print(f"召回率: {metrics['召回率']:.3f}")
             print(f"F1分数: {metrics['F1']:.3f}")
+            print(f"AUC: {metrics['AUC']:.3f}")
             print(f"混淆矩阵(n=0是<=5%，n=1是>5%): ")
             print(metrics['混淆矩阵'])
 
@@ -640,6 +698,15 @@ class RollingStockPredictor:
             idx = all_dates.index(date_str)
             if idx >= 1:
                 return all_dates[idx-1]
+        return None
+
+    @staticmethod
+    def get_next_trade_date(df: pd.DataFrame, date_str: str) -> str:
+        all_dates = sorted(df['trade_date'].unique())
+        if date_str in all_dates:
+            idx = all_dates.index(date_str)
+            if idx < len(all_dates) - 1:
+                return all_dates[idx+1]
         return None
 
     def _cleanup_old_prediction_files(self, results_dir: str, max_files: int = 20):
@@ -743,14 +810,17 @@ def main():
     parser.add_argument('--end-date', type=str, help='预测结束日期 (YYYY-MM-DD)')
     parser.add_argument('--predict-days', type=int, default=1, help='预测天数')
     parser.add_argument('--max-stocks', type=int, help='限制股票数量用于调试')
-    parser.add_argument('--majority-undersampling-ratio', type=float, default=0.1, help='多数类下采样比例')
+    parser.add_argument('--majority-undersampling-ratio', type=float, default=0.2, help='多数类下采样比例 (建议0.1-0.3)')
+    parser.add_argument('--exclude-one-word-limit', action='store_true', default=False, help='排除一字板股票的涨幅标签')
+    parser.add_argument('--include-one-word-limit', action='store_false', dest='exclude_one_word_limit', help='包含一字板股票的涨幅标签')
 
     args = parser.parse_args()
 
     # 创建预测器
     predictor = RollingStockPredictor(
         majority_undersampling_ratio=args.majority_undersampling_ratio,
-        max_stocks=args.max_stocks
+        max_stocks=args.max_stocks,
+        exclude_one_word_limit=args.exclude_one_word_limit
     )
 
     # 执行滚动预测
