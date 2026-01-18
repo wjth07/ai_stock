@@ -213,7 +213,8 @@ class TimeSeriesStockPredictor:
                  model_type: str = "LSTM", d_model: int = 64, nhead: int = 4,
                  neg_ratio: int = 8, rank_loss_weight: float = 0.2,
                  use_soft_label: bool = False, use_regression_head: bool = False,
-                 reg_loss_weight: float = 0.0):
+                 reg_loss_weight: float = 0.0, topk_loss_weight: float = 0.0,
+                 topk_k: int = 20):
         self.model_dir = os.path.join(model_dir, "ts_models")
         self.cache_dir = os.path.join(self.model_dir, "cache")
         self.scaler_path = os.path.join(self.model_dir, "scaler.pkl")
@@ -235,6 +236,8 @@ class TimeSeriesStockPredictor:
         self.use_soft_label = use_soft_label
         self.use_regression_head = use_regression_head
         self.reg_loss_weight = reg_loss_weight
+        self.topk_loss_weight = topk_loss_weight
+        self.topk_k = topk_k
         
         # 股票代码映射
         self.stock2idx = {'<UNK>': 0}
@@ -721,11 +724,20 @@ class TimeSeriesStockPredictor:
                     target_rank = torch.ones(num_pairs, 1).to(device)
                     loss_rank = rank_criterion(pos_scores, neg_scores, target_rank)
                 
-                # 总 Loss = BCE + 0.2 * Ranking
                 loss = loss_bce + self.rank_loss_weight * loss_rank
                 if self.use_regression_head and outputs_reg is not None and y_reg_batch is not None:
                     loss_reg = regression_criterion(outputs_reg, y_reg_batch)
                     loss = loss + self.reg_loss_weight * loss_reg
+                if self.topk_loss_weight > 0 and y_reg_batch is not None:
+                    probs = outputs_cls.view(-1)
+                    k = min(self.topk_k, probs.shape[0])
+                    if k > 0:
+                        topk_vals, topk_idx = torch.topk(probs, k)
+                        returns_topk = y_reg_batch.view(-1)[topk_idx]
+                        neg_penalty = torch.relu(-returns_topk)
+                        if neg_penalty.numel() > 0:
+                            loss_topk = neg_penalty.mean()
+                            loss = loss + self.topk_loss_weight * loss_topk
                 
                 loss.backward()
                 optimizer.step()
@@ -1199,6 +1211,8 @@ def main():
     parser.add_argument('--use-soft-label', action='store_true', help='使用软标签训练')
     parser.add_argument('--use-regression-head', action='store_true', help='启用回归头预测收益率')
     parser.add_argument('--reg-loss-weight', type=float, default=0.0, help='回归损失权重')
+    parser.add_argument('--topk-loss-weight', type=float, default=0.0, help='TopK收益率惩罚损失权重')
+    parser.add_argument('--topk-k', type=int, default=20, help='TopK损失中关注的股票数量')
     parser.add_argument('--extra-predict-dates', type=str, help='使用当前训练模型额外评估的日期，逗号分隔')
     parser.add_argument('--eval-only', action='store_true', help='仅评估指定模型，不重新训练')
     parser.add_argument('--model-path', type=str, help='模型权重文件路径，仅eval-only模式使用')
@@ -1224,7 +1238,9 @@ def main():
         rank_loss_weight=args.rank_loss_weight,
         use_soft_label=args.use_soft_label,
         use_regression_head=args.use_regression_head,
-        reg_loss_weight=args.reg_loss_weight
+        reg_loss_weight=args.reg_loss_weight,
+        topk_loss_weight=args.topk_loss_weight,
+        topk_k=args.topk_k
     )
     
     predict_date = args.end_date if args.end_date else datetime.now().strftime('%Y-%m-%d')
