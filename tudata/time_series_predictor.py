@@ -39,10 +39,11 @@ class FocalLoss(nn.Module):
 
 class StockDataset(Dataset):
     """股票时间序列数据集"""
-    def __init__(self, X, y=None, stock_indices=None):
+    def __init__(self, X, y=None, stock_indices=None, y_reg=None):
         self.X = torch.FloatTensor(X)
         self.y = torch.FloatTensor(y) if y is not None else None
         self.stock_indices = torch.LongTensor(stock_indices) if stock_indices is not None else None
+        self.y_reg = torch.FloatTensor(y_reg) if y_reg is not None else None
 
     def __len__(self):
         return len(self.X)
@@ -50,7 +51,11 @@ class StockDataset(Dataset):
     def __getitem__(self, idx):
         if self.y is not None:
             if self.stock_indices is not None:
+                if self.y_reg is not None:
+                    return self.X[idx], self.y[idx], self.stock_indices[idx], self.y_reg[idx]
                 return self.X[idx], self.y[idx], self.stock_indices[idx]
+            if self.y_reg is not None:
+                return self.X[idx], self.y[idx], self.y_reg[idx]
             return self.X[idx], self.y[idx]
         
         if self.stock_indices is not None:
@@ -59,76 +64,75 @@ class StockDataset(Dataset):
 
 class LSTMModel(nn.Module):
     """LSTM股票预测模型"""
-    def __init__(self, input_dim, hidden_dim=64, num_layers=2, dropout=0.2, num_stocks=None, embedding_dim=16):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2, dropout=0.2, num_stocks=None, embedding_dim=16, use_regression_head: bool = False):
         super(LSTMModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        
-        # Stock Embedding
         self.num_stocks = num_stocks
         self.embedding_dim = embedding_dim if num_stocks else 0
+        self.use_regression_head = use_regression_head
         if self.num_stocks:
             self.stock_embedding = nn.Embedding(num_stocks, self.embedding_dim)
-        
         self.lstm = nn.LSTM(
-            input_dim, 
-            hidden_dim, 
-            num_layers, 
-            batch_first=True, 
+            input_dim,
+            hidden_dim,
+            num_layers,
+            batch_first=True,
             dropout=dropout
         )
-        
-        # FC input dim = hidden_dim + embedding_dim
         fc_input_dim = hidden_dim + self.embedding_dim
-        
-        self.fc = nn.Sequential(
+        self.fc_cls = nn.Sequential(
             nn.Linear(fc_input_dim, 32),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(32, 1),
             nn.Sigmoid()
         )
+        if self.use_regression_head:
+            self.fc_reg = nn.Sequential(
+                nn.Linear(fc_input_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, 1)
+            )
+        else:
+            self.fc_reg = None
 
-    def forward(self, x, stock_idx=None):
-        # x shape: (batch_size, seq_len, input_dim)
-        # h0, c0 shape: (num_layers, batch_size, hidden_dim)
+    def _encode(self, x, stock_idx=None):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
-        
-        # out shape: (batch_size, seq_len, hidden_dim)
         out, _ = self.lstm(x, (h0, c0))
-        
-        # 取最后一个时间步的输出
-        # out[:, -1, :] shape: (batch_size, hidden_dim)
         out = out[:, -1, :]
-        
         if self.num_stocks and stock_idx is not None:
-            # stock_idx shape: (batch_size,)
-            emb = self.stock_embedding(stock_idx) # (batch_size, embedding_dim)
+            emb = self.stock_embedding(stock_idx)
             out = torch.cat([out, emb], dim=1)
-            
-        out = self.fc(out)
         return out
+
+    def forward(self, x, stock_idx=None):
+        features = self._encode(x, stock_idx)
+        out = self.fc_cls(features)
+        return out
+
+    def forward_with_regression(self, x, stock_idx=None):
+        features = self._encode(x, stock_idx)
+        cls_out = self.fc_cls(features)
+        reg_out = None
+        if self.use_regression_head and self.fc_reg is not None:
+            reg_out = self.fc_reg(features)
+        return cls_out, reg_out
 
 class TransformerModel(nn.Module):
     """Transformer股票预测模型"""
-    def __init__(self, input_dim, d_model=64, nhead=4, num_layers=2, dropout=0.2, num_stocks=None, embedding_dim=16):
+    def __init__(self, input_dim, d_model=64, nhead=4, num_layers=2, dropout=0.2, num_stocks=None, embedding_dim=16, use_regression_head: bool = False):
         super(TransformerModel, self).__init__()
         self.d_model = d_model
-        
-        # Stock Embedding
         self.num_stocks = num_stocks
         self.embedding_dim = embedding_dim if num_stocks else 0
+        self.use_regression_head = use_regression_head
         if self.num_stocks:
             self.stock_embedding = nn.Embedding(num_stocks, self.embedding_dim)
-        
-        # 输入线性变换
         self.input_projection = nn.Linear(input_dim, d_model)
-        
-        # 位置编码
         self.pos_encoding = PositionalEncoding(d_model, dropout)
-        
-        # Transformer编码器层
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -138,11 +142,7 @@ class TransformerModel(nn.Module):
             batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-        
-        # FC input dim = d_model + embedding_dim
         fc_input_dim = d_model + self.embedding_dim
-        
-        # 分类头
         self.classifier = nn.Sequential(
             nn.Linear(fc_input_dim, 32),
             nn.ReLU(),
@@ -150,31 +150,39 @@ class TransformerModel(nn.Module):
             nn.Linear(32, 1),
             nn.Sigmoid()
         )
+        if self.use_regression_head:
+            self.regressor = nn.Sequential(
+                nn.Linear(fc_input_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, 1)
+            )
+        else:
+            self.regressor = None
 
-    def forward(self, x, stock_idx=None):
-        # x shape: (batch_size, seq_len, input_dim)
+    def _encode(self, x, stock_idx=None):
         batch_size, seq_len, _ = x.shape
-        
-        # 输入投影
-        x = self.input_projection(x)  # (batch_size, seq_len, d_model)
-        
-        # 添加位置编码
+        x = self.input_projection(x)
         x = self.pos_encoding(x)
-        
-        # Transformer编码器
-        # 注意：PyTorch的Transformer需要src_mask来处理padding，这里我们假设所有序列长度相同
-        transformer_out = self.transformer_encoder(x)  # (batch_size, seq_len, d_model)
-        
-        # 全局平均池化
-        pooled = torch.mean(transformer_out, dim=1)  # (batch_size, d_model)
-        
+        transformer_out = self.transformer_encoder(x)
+        pooled = torch.mean(transformer_out, dim=1)
         if self.num_stocks and stock_idx is not None:
             emb = self.stock_embedding(stock_idx)
             pooled = torch.cat([pooled, emb], dim=1)
-            
-        # 分类
-        output = self.classifier(pooled)  # (batch_size, 1)
+        return pooled
+
+    def forward(self, x, stock_idx=None):
+        features = self._encode(x, stock_idx)
+        output = self.classifier(features)
         return output
+
+    def forward_with_regression(self, x, stock_idx=None):
+        features = self._encode(x, stock_idx)
+        cls_out = self.classifier(features)
+        reg_out = None
+        if self.use_regression_head and self.regressor is not None:
+            reg_out = self.regressor(features)
+        return cls_out, reg_out
 
 class PositionalEncoding(nn.Module):
     """位置编码"""
@@ -203,7 +211,9 @@ class TimeSeriesStockPredictor:
                  batch_size: int = 64, epochs: int = 10, learning_rate: float = 0.001,
                  max_stocks: int = None, exclude_one_word_limit: bool = False,
                  model_type: str = "LSTM", d_model: int = 64, nhead: int = 4,
-                 neg_ratio: int = 8, rank_loss_weight: float = 0.2):
+                 neg_ratio: int = 8, rank_loss_weight: float = 0.2,
+                 use_soft_label: bool = False, use_regression_head: bool = False,
+                 reg_loss_weight: float = 0.0):
         self.model_dir = os.path.join(model_dir, "ts_models")
         self.cache_dir = os.path.join(self.model_dir, "cache")
         self.scaler_path = os.path.join(self.model_dir, "scaler.pkl")
@@ -222,6 +232,9 @@ class TimeSeriesStockPredictor:
         self.nhead = nhead
         self.neg_ratio = neg_ratio
         self.rank_loss_weight = rank_loss_weight
+        self.use_soft_label = use_soft_label
+        self.use_regression_head = use_regression_head
+        self.reg_loss_weight = reg_loss_weight
         
         # 股票代码映射
         self.stock2idx = {'<UNK>': 0}
@@ -230,7 +243,7 @@ class TimeSeriesStockPredictor:
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs(self.cache_dir, exist_ok=True)
         
-    def prepare_data_for_date(self, data_dir: str = "daily", cutoff_date: str = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def prepare_data_for_date(self, data_dir: str = "daily", cutoff_date: str = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """
         准备截止到指定日期之前的所有训练数据 (序列格式)
         Returns:
@@ -245,6 +258,7 @@ class TimeSeriesStockPredictor:
         X_cache_path = os.path.join(self.cache_dir, f"{cache_prefix}_X.pkl")
         y_cache_path = os.path.join(self.cache_dir, f"{cache_prefix}_y.pkl")
         S_cache_path = os.path.join(self.cache_dir, f"{cache_prefix}_S.pkl")
+        y_ret_cache_path = os.path.join(self.cache_dir, f"{cache_prefix}_y_ret.pkl")
 
         # 检查缓存
         cache_valid = False
@@ -252,19 +266,22 @@ class TimeSeriesStockPredictor:
             print(f"✓ 检测到序列缓存数据 ({cutoff_date})，正在加载...")
             try:
                 X = joblib.load(X_cache_path)
-                
-                # 检查特征维度
                 current_features = self.feature_engineer.get_feature_columns()
                 if X.shape[2] != len(current_features):
                     print(f"⚠ 缓存特征维度 ({X.shape[2]}) 与当前配置 ({len(current_features)}) 不匹配，将重新生成...")
                 else:
                     y = joblib.load(y_cache_path)
                     S = joblib.load(S_cache_path)
-                    
-                    # 加载股票映射
+                    y_ret = None
+                    need_returns = self.use_soft_label or self.use_regression_head
+                    if need_returns:
+                        if os.path.exists(y_ret_cache_path):
+                            y_ret = joblib.load(y_ret_cache_path)
+                        else:
+                            print("⚠ 未找到收益率缓存，将重新生成全量数据...")
+                            raise RuntimeError("missing y_ret cache")
                     with open(self.stock_map_path, 'r') as f:
                         self.stock2idx = json.load(f)
-                        
                     print(f"✓ 序列缓存加载完成: X={X.shape}, y={y.shape}, S={S.shape}")
                     print(f"✓ 股票映射加载完成: {len(self.stock2idx)} 只股票")
                     cache_valid = True
@@ -284,7 +301,7 @@ class TimeSeriesStockPredictor:
                 t0 = time.time()
                 
                 # 1. 采样计算均值和方差
-                sample_size = min(100000, N)
+                sample_size = min(1000000, N)
                 indices = np.random.choice(N, sample_size, replace=False)
                 X_sample = X[indices].reshape(-1, F)
                 
@@ -301,7 +318,9 @@ class TimeSeriesStockPredictor:
             scale = scaler.scale_.astype(np.float32)
             X = (X - mean) / scale
             
-            return X, y, S
+            if 'y_ret' not in locals():
+                y_ret = None
+            return X, y, S, y_ret
 
         print(f"准备截止到 {cutoff_date} 的序列训练数据...")
         all_X = []
@@ -343,6 +362,7 @@ class TimeSeriesStockPredictor:
         current_chunk_X = []
         current_chunk_y = []
         current_chunk_S = []
+        current_chunk_y_ret = []
         chunk_files = []
         total_samples = 0
         chunk_size = 100 # 每100只股票保存一次
@@ -375,16 +395,26 @@ class TimeSeriesStockPredictor:
                             window_size=self.window_size,
                             target_col='TARGET_T1_OVER_5PCT'
                         )
+                        _, y_ret_seq = self.feature_engineer.create_sequence_data(
+                            df,
+                            window_size=self.window_size,
+                            target_col='TARGET_RETURNS_T1_PCT'
+                        )
                         
                         if len(X_seq) > 0:
                             # 立即转换为 float32 节省内存
                             X_seq = X_seq.astype(np.float32)
                             y_seq = y_seq.astype(np.float32)
+                            if y_ret_seq is not None and len(y_ret_seq) == len(y_seq):
+                                y_ret_seq = y_ret_seq.astype(np.float32)
+                            else:
+                                y_ret_seq = np.zeros(len(y_seq), dtype=np.float32)
                             S_seq = np.full(len(X_seq), stock_idx, dtype=np.int64)
                             
                             current_chunk_X.append(X_seq)
                             current_chunk_y.append(y_seq)
                             current_chunk_S.append(S_seq)
+                            current_chunk_y_ret.append(y_ret_seq)
                             
                             total_samples += len(X_seq)
                             processed_count += 1
@@ -395,7 +425,8 @@ class TimeSeriesStockPredictor:
                                 chunk_data = {
                                     'X': np.concatenate(current_chunk_X, axis=0),
                                     'y': np.concatenate(current_chunk_y, axis=0),
-                                    'S': np.concatenate(current_chunk_S, axis=0)
+                                    'S': np.concatenate(current_chunk_S, axis=0),
+                                    'y_ret': np.concatenate(current_chunk_y_ret, axis=0),
                                 }
                                 joblib.dump(chunk_data, chunk_path)
                                 chunk_files.append(chunk_path)
@@ -404,6 +435,7 @@ class TimeSeriesStockPredictor:
                                 current_chunk_X = []
                                 current_chunk_y = []
                                 current_chunk_S = []
+                                current_chunk_y_ret = []
                                 import gc
                                 gc.collect()
                             
@@ -417,13 +449,15 @@ class TimeSeriesStockPredictor:
             chunk_data = {
                 'X': np.concatenate(current_chunk_X, axis=0),
                 'y': np.concatenate(current_chunk_y, axis=0),
-                'S': np.concatenate(current_chunk_S, axis=0)
+                'S': np.concatenate(current_chunk_S, axis=0),
+                'y_ret': np.concatenate(current_chunk_y_ret, axis=0),
             }
             joblib.dump(chunk_data, chunk_path)
             chunk_files.append(chunk_path)
             current_chunk_X = []
             current_chunk_y = []
             current_chunk_S = []
+            current_chunk_y_ret = []
         
         if total_samples == 0:
             raise ValueError(f"截止到 {cutoff_date} 没有找到有效的训练数据")
@@ -438,6 +472,7 @@ class TimeSeriesStockPredictor:
         X = np.zeros((total_samples, window_size, feature_dim), dtype=np.float32)
         y = np.zeros((total_samples,), dtype=np.float32)
         S = np.zeros((total_samples,), dtype=np.int64)
+        y_ret = np.zeros((total_samples,), dtype=np.float32)
         
         # 填充大数组
         start_idx = 0
@@ -449,6 +484,8 @@ class TimeSeriesStockPredictor:
             X[start_idx:end_idx] = chunk_data['X']
             y[start_idx:end_idx] = chunk_data['y']
             S[start_idx:end_idx] = chunk_data['S']
+            if 'y_ret' in chunk_data:
+                y_ret[start_idx:end_idx] = chunk_data['y_ret']
             
             start_idx = end_idx
             
@@ -464,6 +501,7 @@ class TimeSeriesStockPredictor:
         joblib.dump(X, X_cache_path)
         joblib.dump(y, y_cache_path)
         joblib.dump(S, S_cache_path)
+        joblib.dump(y_ret, y_ret_cache_path)
         
         # 保存股票映射
         with open(self.stock_map_path, 'w') as f:
@@ -478,7 +516,7 @@ class TimeSeriesStockPredictor:
         t0 = time.time()
         
         # 1. 采样计算均值和方差
-        sample_size = min(100000, N)
+        sample_size = min(1000000, N)
         indices = np.random.choice(N, sample_size, replace=False)
         X_sample = X[indices].reshape(-1, F)
         
@@ -498,14 +536,15 @@ class TimeSeriesStockPredictor:
         joblib.dump(scaler, self.scaler_path)
         
         print(f"数据准备完成: X={X.shape}, y={y.shape}, S={S.shape}")
-        return X, y, S
+        return X, y, S, y_ret
 
-    def train_model(self, X_train, y_train, S_train=None, predict_date=None):
+    def train_model(self, X_train, y_train, S_train=None, y_train_ret=None, predict_date=None):
         """训练模型（支持LSTM和Transformer），全量数据训练，无验证集"""
         # 全量训练，不划分验证集
         X_train_sub = X_train
         y_train_sub = y_train
         S_train_sub = S_train
+        y_train_ret_sub = y_train_ret
         
         input_dim = X_train.shape[2]
         
@@ -530,10 +569,10 @@ class TimeSeriesStockPredictor:
             print("小样本模式：禁用 Dropout")
 
         if self.model_type == "LSTM":
-            model = LSTMModel(input_dim, self.hidden_dim, self.num_layers, dropout=dropout_rate, num_stocks=num_stocks).to(device)
+            model = LSTMModel(input_dim, self.hidden_dim, self.num_layers, dropout=dropout_rate, num_stocks=num_stocks, use_regression_head=self.use_regression_head).to(device)
             print(f"\n开始训练 LSTM 模型 (Device: {device})...")
         elif self.model_type == "TRANSFORMER":
-            model = TransformerModel(input_dim, self.d_model, self.nhead, self.num_layers, dropout=dropout_rate, num_stocks=num_stocks).to(device)
+            model = TransformerModel(input_dim, self.d_model, self.nhead, self.num_layers, dropout=dropout_rate, num_stocks=num_stocks, use_regression_head=self.use_regression_head).to(device)
             print(f"\n开始训练 Transformer 模型 (Device: {device})...")
         else:
             raise ValueError(f"不支持的模型类型: {self.model_type}")
@@ -541,7 +580,7 @@ class TimeSeriesStockPredictor:
         # 计算正样本权重 (用于处理类别不平衡)
         pos_count = np.sum(y_train_sub)
         neg_count = len(y_train_sub) - pos_count
-        pos_weight_val = neg_count / (pos_count + 1e-5) # 简单的反比权重
+        pos_weight_val = float(neg_count / (pos_count + 1e-5))
         
         # 使用 Focal Loss 应对类别不平衡
         # alpha=0.25 意味着降低负样本（多数类）的权重
@@ -555,12 +594,16 @@ class TimeSeriesStockPredictor:
         
         current_criterion = nn.BCELoss(reduction='none')
         rank_criterion = nn.MarginRankingLoss(margin=0.2) # Ranking Loss
+        regression_criterion = nn.MSELoss()
         
         # criterion = nn.BCELoss() # 回退到 BCELoss 以测试过拟合能力
         optimizer = optim.Adam(model.parameters(), lr=self.learning_rate)
         
         # 创建DataLoader
-        train_dataset = StockDataset(X_train_sub, y_train_sub, stock_indices=S_train_sub)
+        if (self.use_soft_label or self.use_regression_head) and y_train_ret_sub is not None:
+            train_dataset = StockDataset(X_train_sub, y_train_sub, stock_indices=S_train_sub, y_reg=y_train_ret_sub)
+        else:
+            train_dataset = StockDataset(X_train_sub, y_train_sub, stock_indices=S_train_sub)
         # val_dataset = StockDataset(X_val, y_val)
         
         train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
@@ -618,34 +661,44 @@ class TimeSeriesStockPredictor:
             
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs} [Train]")
             for batch in progress_bar:
-                if len(batch) == 3:
+                if len(batch) == 4:
+                    X_batch, y_batch, S_batch, y_reg_batch = batch
+                    S_batch = S_batch.to(device)
+                    y_reg_batch = y_reg_batch.to(device).unsqueeze(1)
+                elif len(batch) == 3:
                     X_batch, y_batch, S_batch = batch
                     S_batch = S_batch.to(device)
+                    y_reg_batch = None
                 else:
                     X_batch, y_batch = batch
                     S_batch = None
-                
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device).unsqueeze(1)
-                
+                    y_reg_batch = None
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.to(device).unsqueeze(1)
+                y_true_batch = y_batch
                 optimizer.zero_grad()
-                outputs = model(X_batch, stock_idx=S_batch)
-                # 计算损失
-                # loss = criterion(outputs, y_batch)
-                loss_per_sample = current_criterion(outputs, y_batch)
-                
-                # 如果没有下采样且正负样本极度不平衡，应用正样本权重
-                weights = torch.ones_like(y_batch)
-                # 如果是小样本未下采样模式，应用权重
-                if dropout_rate == 0.0: # 借用 dropout_rate==0.0 作为小样本未下采样模式的标记
-                     if (self.max_stocks is not None and self.max_stocks <= 50):
-                         weights[y_batch == 1] = pos_weight_val
-                
+                if self.use_regression_head:
+                    outputs_cls, outputs_reg = model.forward_with_regression(X_batch, stock_idx=S_batch)
+                else:
+                    outputs_cls = model(X_batch, stock_idx=S_batch)
+                    outputs_reg = None
+                targets = y_batch
+                if self.use_soft_label and y_reg_batch is not None:
+                    soft_targets = targets.clone()
+                    mask_between = (y_reg_batch > 0) & (y_reg_batch < 5)
+                    soft_targets[mask_between] = y_reg_batch[mask_between] / 5.0
+                    targets = soft_targets
+                loss_per_sample = current_criterion(outputs_cls, targets)
+                weights = torch.ones_like(y_true_batch)
+                if dropout_rate == 0.0:
+                    if (self.max_stocks is not None and self.max_stocks <= 50):
+                        weights[y_true_batch == 1] = pos_weight_val
                 loss_bce = (loss_per_sample * weights).mean()
                 
                 # === Ranking Loss ===
                 # 在 batch 内构建正负样本对
                 # y_batch shape: (batch_size, 1) -> flatten -> (batch_size,)
-                y_flat = y_batch.view(-1)
+                y_flat = y_true_batch.view(-1)
                 pos_indices = (y_flat == 1).nonzero(as_tuple=True)[0]
                 neg_indices = (y_flat == 0).nonzero(as_tuple=True)[0]
                 
@@ -661,8 +714,8 @@ class TimeSeriesStockPredictor:
                     pos_idx_sel = pos_indices[torch.randint(0, len(pos_indices), (num_pairs,))]
                     neg_idx_sel = neg_indices[torch.randint(0, len(neg_indices), (num_pairs,))]
                     
-                    pos_scores = outputs[pos_idx_sel]
-                    neg_scores = outputs[neg_idx_sel]
+                    pos_scores = outputs_cls[pos_idx_sel]
+                    neg_scores = outputs_cls[neg_idx_sel]
                     
                     # Target=1 表示 x1 > x2
                     target_rank = torch.ones(num_pairs, 1).to(device)
@@ -670,13 +723,16 @@ class TimeSeriesStockPredictor:
                 
                 # 总 Loss = BCE + 0.2 * Ranking
                 loss = loss_bce + self.rank_loss_weight * loss_rank
+                if self.use_regression_head and outputs_reg is not None and y_reg_batch is not None:
+                    loss_reg = regression_criterion(outputs_reg, y_reg_batch)
+                    loss = loss + self.reg_loss_weight * loss_reg
                 
                 loss.backward()
                 optimizer.step()
                 
                 total_loss += loss.item()
-                train_preds.extend(outputs.detach().cpu().numpy())
-                train_targets.extend(y_batch.detach().cpu().numpy())
+                train_preds.extend(outputs_cls.detach().cpu().numpy())
+                train_targets.extend(y_true_batch.detach().cpu().numpy())
                 
                 progress_bar.set_postfix({'loss': loss.item()})
             
@@ -763,8 +819,9 @@ class TimeSeriesStockPredictor:
         # 寻找最佳阈值 (基于全量训练数据)
         model.eval()
         train_preds_final = []
-        # 使用不打乱的 DataLoader 进行预测
-        train_eval_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=False)
+        # 使用不打乱的 DataLoader 进行预测（不包含回归标签）
+        train_eval_dataset = StockDataset(X_train_sub, y_train_sub, stock_indices=S_train_sub)
+        train_eval_loader = DataLoader(train_eval_dataset, batch_size=self.batch_size, shuffle=False)
         
         with torch.no_grad():
             for batch in train_eval_loader:
@@ -888,12 +945,27 @@ class TimeSeriesStockPredictor:
                 with open(self.stock_map_path, 'r') as f:
                     self.stock2idx = json.load(f)
         
-        files = sorted([f for f in os.listdir("daily") if f.endswith('_daily.csv')])
+        data_dir_resolved = "daily"
+        if not os.path.isabs(data_dir_resolved):
+            if not os.path.isdir(data_dir_resolved):
+                script_dir = os.path.dirname(__file__)
+                candidates = [
+                    os.path.join(script_dir, data_dir_resolved),
+                    os.path.join(os.path.dirname(script_dir), "data", data_dir_resolved),
+                ]
+                for cand in candidates:
+                    if os.path.isdir(cand):
+                        data_dir_resolved = cand
+                        break
+        if not os.path.isdir(data_dir_resolved):
+            raise FileNotFoundError(f"数据目录不存在: {data_dir_resolved}")
+        
+        files = sorted([f for f in os.listdir(data_dir_resolved) if f.endswith('_daily.csv')])
         if self.max_stocks:
             files = files[:self.max_stocks]
 
         for file in tqdm(files, desc=f"构建预测日序列"):
-            file_path = os.path.join("daily", file)
+            file_path = os.path.join(data_dir_resolved, file)
             # 解析股票代码
             stock_code = file.replace('_daily.csv', '')
             stock_idx = self.stock2idx.get(stock_code, 0) # 0 is <UNK>
@@ -981,7 +1053,7 @@ class TimeSeriesStockPredictor:
     def predict_single_day(self, train_cutoff_date: str, predict_date: str, extra_predict_dates: Optional[List[str]] = None) -> Dict:
         """预测单日结果，并进行详细评估"""
         # 1. 准备训练数据
-        X_train, y_train, S_train = self.prepare_data_for_date(cutoff_date=train_cutoff_date)
+        X_train, y_train, S_train, y_train_ret = self.prepare_data_for_date(cutoff_date=train_cutoff_date)
         
         # 下采样平衡类别 - 打印原始数据分布
         pos_indices = np.where(y_train == 1)[0]
@@ -1005,10 +1077,12 @@ class TimeSeriesStockPredictor:
             X_train = X_train[selected_indices]
             y_train = y_train[selected_indices]
             S_train = S_train[selected_indices]
+            if y_train_ret is not None:
+                y_train_ret = y_train_ret[selected_indices]
             print(f"下采样后数据分布 - 正样本: {len(pos_indices)}, 负样本: {n_neg}, 比例: 1:{neg_ratio}")
             print(f"下采样后训练数据: {X_train.shape}")
             
-        model = self.train_model(X_train, y_train, S_train=S_train, predict_date=predict_date)
+        model = self.train_model(X_train, y_train, S_train=S_train, y_train_ret=y_train_ret, predict_date=predict_date)
         model_path = os.path.join(self.model_dir, f"best_model_{self.model_type.lower()}_{train_cutoff_date.replace('-', '')}.pth")
         torch.save(model.state_dict(), model_path)
         print(f"模型已保存: {model_path}")
@@ -1122,6 +1196,9 @@ def main():
     parser.add_argument('--learning-rate', '--lr', dest='learning_rate', type=float, default=0.001, help='学习率')
     parser.add_argument('--neg-ratio', type=int, default=8, help='负样本下采样比例')
     parser.add_argument('--rank-loss-weight', type=float, default=0.2, help='Ranking Loss权重')
+    parser.add_argument('--use-soft-label', action='store_true', help='使用软标签训练')
+    parser.add_argument('--use-regression-head', action='store_true', help='启用回归头预测收益率')
+    parser.add_argument('--reg-loss-weight', type=float, default=0.0, help='回归损失权重')
     parser.add_argument('--extra-predict-dates', type=str, help='使用当前训练模型额外评估的日期，逗号分隔')
     parser.add_argument('--eval-only', action='store_true', help='仅评估指定模型，不重新训练')
     parser.add_argument('--model-path', type=str, help='模型权重文件路径，仅eval-only模式使用')
@@ -1144,7 +1221,10 @@ def main():
         nhead=args.nhead,
         num_layers=args.num_layers,
         neg_ratio=args.neg_ratio,
-        rank_loss_weight=args.rank_loss_weight
+        rank_loss_weight=args.rank_loss_weight,
+        use_soft_label=args.use_soft_label,
+        use_regression_head=args.use_regression_head,
+        reg_loss_weight=args.reg_loss_weight
     )
     
     predict_date = args.end_date if args.end_date else datetime.now().strftime('%Y-%m-%d')
@@ -1170,9 +1250,9 @@ def main():
         num_stocks = len(predictor.stock2idx) if predictor.stock2idx else None
         dropout_rate = 0.0 if (predictor.max_stocks is not None and predictor.max_stocks <= 50) else 0.2
         if predictor.model_type == "LSTM":
-            model = LSTMModel(input_dim, predictor.hidden_dim, predictor.num_layers, dropout=dropout_rate, num_stocks=num_stocks).to(device)
+            model = LSTMModel(input_dim, predictor.hidden_dim, predictor.num_layers, dropout=dropout_rate, num_stocks=num_stocks, use_regression_head=predictor.use_regression_head).to(device)
         elif predictor.model_type == "TRANSFORMER":
-            model = TransformerModel(input_dim, predictor.d_model, predictor.nhead, predictor.num_layers, dropout=dropout_rate, num_stocks=num_stocks).to(device)
+            model = TransformerModel(input_dim, predictor.d_model, predictor.nhead, predictor.num_layers, dropout=dropout_rate, num_stocks=num_stocks, use_regression_head=predictor.use_regression_head).to(device)
         else:
             raise ValueError(f"不支持的模型类型: {predictor.model_type}")
         state_dict = torch.load(model_path, map_location=device)
