@@ -304,7 +304,7 @@ class TimeSeriesStockPredictor:
                 t0 = time.time()
                 
                 # 1. 采样计算均值和方差
-                sample_size = min(1000000, N)
+                sample_size = min(200000, N)
                 indices = np.random.choice(N, sample_size, replace=False)
                 X_sample = X[indices].reshape(-1, F)
                 
@@ -319,7 +319,8 @@ class TimeSeriesStockPredictor:
             print("正在应用标准化变换...")
             mean = scaler.mean_.astype(np.float32)
             scale = scaler.scale_.astype(np.float32)
-            X = (X - mean) / scale
+            X -= mean
+            X /= scale
             
             if 'y_ret' not in locals():
                 y_ret = None
@@ -519,7 +520,7 @@ class TimeSeriesStockPredictor:
         t0 = time.time()
         
         # 1. 采样计算均值和方差
-        sample_size = min(1000000, N)
+        sample_size = min(200000, N)
         indices = np.random.choice(N, sample_size, replace=False)
         X_sample = X[indices].reshape(-1, F)
         
@@ -533,7 +534,8 @@ class TimeSeriesStockPredictor:
         scale = scaler.scale_.astype(np.float32)
         
         # 利用广播机制直接在 (N, T, F) 上操作，避免 reshape 内存开销
-        X = (X - mean) / scale
+        X -= mean
+        X /= scale
         print(f"  全量变换耗时: {time.time()-t1:.2f}s")
         
         joblib.dump(scaler, self.scaler_path)
